@@ -1,11 +1,4 @@
-// Find TODO statements and complete them to build the interactive airline route map.
-
-// TODO: add your uniqname to the HTML (use id #uniqname) file so that your work can be identified 
-
-// TODO: import data using d3.csv()
-const dataFile = 
-
-const colornone = "#ccc";
+const dataFile = await d3.csv("data/routes.csv");
 
 // define colors for airlines, you can expand this as needed, WN is Southwest, B6 is JetBlue
 const airlineColor = { WN: "orange", B6: "steelblue" };
@@ -23,7 +16,7 @@ select.selectAll("option")
     .data(airlines)
     .join("option")
     .attr("value", d => d)
-    .text(// TODO: build options from selector that allows us to view all airlines or filter by a specific airline);
+    .text(d => d === "all" ? "All Airlines" : airlineName[d] ?? d);
 
 // helper function to build outgoing links for each leaf node
 function bilink(root) {
@@ -32,9 +25,16 @@ function bilink(root) {
 
     // for each leaf node, build an outgoing array of [source, target, airline] tuples
     for (const d of root.leaves()) {
-        d.outgoing = d.data.destinations
+        d.incoming = [];
+        d.outgoing = (d.data.destinations ?? [])
             .map(({ target, airline, targetRegion }) => [d, map.get(`root/${targetRegion}/${target}`), airline])
             .filter(([, target]) => target !== undefined);
+    }
+
+    for (const d of root.leaves()) {
+        for (const route of d.outgoing) {
+            route[1].incoming.push(route);
+        }
     }
 
     return root;
@@ -53,18 +53,46 @@ function draw(airlineFilter) {
         ? dataFile
         : dataFile.filter(d => d.Airline === airlineFilter);
 
-    // group data by source region and then by source airport
-    const grouped = d3.group(filtered, d => d["Source region"], d => d["Source airport"]);
+    const airportMap = new Map();
+
+    for (const route of filtered) {
+        const sourceAirport = route["Source airport"];
+        const destinationAirport = route["Destination airport"];
+        const sourceRegion = route["Source region"];
+        const destinationRegion = route["Destination region"];
+
+        if (!airportMap.has(sourceAirport)) {
+            airportMap.set(sourceAirport, {
+                name: sourceAirport,
+                region: sourceRegion,
+                destinations: []
+            });
+        }
+
+        if (!airportMap.has(destinationAirport)) {
+            airportMap.set(destinationAirport, {
+                name: destinationAirport,
+                region: destinationRegion,
+                destinations: []
+            });
+        }
+
+        airportMap.get(sourceAirport).destinations.push({
+            target: destinationAirport,
+            airline: route.Airline,
+            targetRegion: destinationRegion
+        });
+    }
+
+    // group airports by region so the hierarchy includes destination-only airports as leaves
+    const grouped = d3.group(Array.from(airportMap.values()), d => d.region);
 
     // transform grouped data into a hierarchy format suitable for the chart
     const hierarchyData = {
         name: "root",
         children: Array.from(grouped, ([region, airports]) => ({
             name: region,
-            children: Array.from(airports, ([airport, routes]) => ({
-                name: airport,
-                destinations: routes.map(r => ({ target: r["Destination airport"], airline: r.Airline, targetRegion: r["Destination region"] }))
-            }))
+            children: airports
         }))
     };
 
@@ -74,11 +102,104 @@ function draw(airlineFilter) {
 
 draw("all"); // initial draw
 
-
-// TODO: integrate code from Observable notebook https://observablehq.com/@d3/hierarchical-edge-bundling 
-// TODO: edit the tooltip to show the airport code, the region, and the number of outgoing and incoming routes for that airport
-// TODO: edit link to show different colors for different airlines, you can use the airlineColor object defined above for reference
-// TODO: edit overed and outed functions to highlight connected links and nodes on hover
 function createChart(data) {
+    const width = 954;
+    const radius = width / 2;
 
+    const tree = d3.cluster().size([2 * Math.PI, radius - 100]);
+    const line = d3.lineRadial()
+        .curve(d3.curveBundle.beta(0.85))
+        .radius(d => d.y)
+        .angle(d => d.x);
+
+    const root = tree(
+        bilink(
+            d3.hierarchy(data)
+                .sort((a, b) => d3.ascending(a.height, b.height) || d3.ascending(a.data.name, b.data.name))
+        )
+    );
+
+    const svg = d3.create("svg")
+        .attr("width", width)
+        .attr("height", width)
+        .attr("viewBox", [-width / 2, -width / 2, width, width])
+        .style("max-width", "100%")
+        .style("height", "auto")
+        .style("display", "block")
+        .style("margin", "0 auto")
+        .style("font", "10px sans-serif");
+
+    const link = svg.append("g")
+        .attr("fill", "none")
+        .selectAll("path")
+        .data(root.leaves().flatMap(leaf => leaf.outgoing))
+        .join("path")
+        .style("mix-blend-mode", "multiply")
+        .attr("stroke", ([, , airline]) => airlineColor[airline] ?? "#444")
+        .attr("stroke-opacity", 0.55)
+        .attr("d", ([source, target]) => line(source.path(target)))
+        .each(function (d) {
+            d.path = this;
+        });
+
+    const node = svg.append("g")
+        .selectAll("text")
+        .data(root.leaves())
+        .join("text")
+        .attr("dy", "0.31em")
+        .attr("x", d => d.x < Math.PI ? 6 : -6)
+        .attr("text-anchor", d => d.x < Math.PI ? "start" : "end")
+        .attr("transform", d => `${`rotate(${d.x * 180 / Math.PI - 90}) translate(${d.y},0)`}${d.x >= Math.PI ? " rotate(180)" : ""}`)
+        .attr("fill", "currentColor")
+        .text(d => d.data.name)
+        .each(function (d) {
+            d.text = this;
+        })
+        .on("mouseover", overed)
+        .on("mouseout", outed);
+
+    node.append("title")
+        .text(d => `Airport: ${d.data.name}
+Region: ${d.parent.data.name}
+Outgoing routes: ${d.outgoing.length}
+Incoming routes: ${d.incoming.length}`);
+
+    function overed(event, d) {
+        const connectedPaths = [
+            ...d.incoming.map(route => route.path),
+            ...d.outgoing.map(route => route.path)
+        ];
+        const connectedTexts = new Set([
+            d.text,
+            ...d.incoming.map(([source]) => source.text),
+            ...d.outgoing.map(([, target]) => target.text)
+        ]);
+
+        d3.selectAll(connectedPaths)
+            .attr("stroke", "black")
+            .attr("stroke-opacity", 1)
+            .raise();
+
+        d3.selectAll(Array.from(connectedTexts))
+            .attr("fill", "black")
+            .attr("font-weight", "bold");
+    }
+
+    function outed(event, d) {
+        d3.selectAll([...d.incoming, ...d.outgoing].map(route => route.path))
+            .attr("stroke", ([, , airline]) => airlineColor[airline] ?? "#444")
+            .attr("stroke-opacity", 0.55);
+
+        d3.selectAll(Array.from(new Set([
+            d.text,
+            ...d.incoming.map(([source]) => source.text),
+            ...d.outgoing.map(([, target]) => target.text)
+        ])))
+            .attr("fill", "currentColor")
+            .attr("font-weight", null);
+
+        link.order();
+    }
+
+    return svg.node();
 }
